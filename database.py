@@ -107,6 +107,18 @@ def init_db():
                 FOREIGN KEY (author_user_id) REFERENCES users(id)
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS card_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                card_id INTEGER NOT NULL,
+                from_column TEXT,
+                to_column TEXT NOT NULL,
+                user_id INTEGER,
+                epoch INTEGER NOT NULL,
+                FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
 
         # Migration: add client_id column to cards if missing
         existing_columns = [row["name"] for row in c.execute("PRAGMA table_info(cards)").fetchall()]
@@ -400,8 +412,10 @@ def _generate_card_number(conn, client_id: int) -> str:
 
 
 def create_card(card_type, title, description=None, assignee=None, expected_delivery=None,
-                 column_name="Backlog", client_id=None):
+                 column_name="Backlog", client_id=None, user_id=None):
+    import time as _t
     now = datetime.utcnow().isoformat()
+    epoch = int(_t.time())
     pos = next_position(column_name)
     with get_conn() as conn:
         card_number = _generate_card_number(conn, client_id) if client_id else None
@@ -410,7 +424,13 @@ def create_card(card_type, title, description=None, assignee=None, expected_deli
             "column_name, position, client_id, card_number, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (card_type, title, description, assignee, expected_delivery, column_name, pos, client_id, card_number, now, now)
         )
-        return cur.lastrowid
+        new_id = cur.lastrowid
+        # Record creation event: from_column=None means "created here"
+        conn.execute(
+            "INSERT INTO card_history (card_id, from_column, to_column, user_id, epoch) VALUES (?,?,?,?,?)",
+            (new_id, None, column_name, user_id, epoch)
+        )
+        return new_id
 
 
 def update_card(card_id, **fields):
@@ -428,8 +448,9 @@ def update_card(card_id, **fields):
         conn.execute(f"UPDATE cards SET {keys} WHERE id = ?", values)
 
 
-def move_card(card_id, new_column, new_position):
+def move_card(card_id, new_column, new_position, user_id=None):
     """Move a card to a new column/position, shifting other cards accordingly."""
+    import time as _t
     with get_conn() as conn:
         card = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
         if not card:
@@ -438,7 +459,7 @@ def move_card(card_id, new_column, new_position):
         old_position = card["position"]
 
         if old_column == new_column:
-            # Reorder within same column
+            # Reorder within same column — no history event
             if new_position > old_position:
                 conn.execute(
                     "UPDATE cards SET position = position - 1 "
@@ -452,17 +473,20 @@ def move_card(card_id, new_column, new_position):
                     (old_column, new_position, old_position)
                 )
         else:
-            # Remove from old column (close gap)
+            # Column change — record history
             conn.execute(
                 "UPDATE cards SET position = position - 1 "
                 "WHERE column_name = ? AND position > ?",
                 (old_column, old_position)
             )
-            # Make space in new column
             conn.execute(
                 "UPDATE cards SET position = position + 1 "
                 "WHERE column_name = ? AND position >= ?",
                 (new_column, new_position)
+            )
+            conn.execute(
+                "INSERT INTO card_history (card_id, from_column, to_column, user_id, epoch) VALUES (?,?,?,?,?)",
+                (card_id, old_column, new_column, user_id, int(_t.time()))
             )
 
         conn.execute(
@@ -579,3 +603,33 @@ def delete_comment(comment_id: int, requesting_user_id: int, is_admin: bool) -> 
             return False
         conn.execute("DELETE FROM card_comments WHERE id = ?", (comment_id,))
         return True
+
+
+# ---------------- Card History ----------------
+
+import time as _time
+
+def add_history_event(card_id: int, to_column: str, user_id: int = None, from_column: str = None):
+    """Record a column transition for a card."""
+    epoch = int(_time.time())
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO card_history (card_id, from_column, to_column, user_id, epoch) VALUES (?,?,?,?,?)",
+            (card_id, from_column, to_column, user_id, epoch)
+        )
+
+
+def get_card_history(card_id: int):
+    """Return history events for a card, oldest first, with user info joined."""
+    with get_conn() as conn:
+        return conn.execute("""
+            SELECT ch.id, ch.card_id, ch.from_column, ch.to_column, ch.epoch,
+                   u.full_name  AS user_name,
+                   u.color      AS user_color,
+                   u.avatar_path AS user_avatar,
+                   u.username   AS username
+            FROM card_history ch
+            LEFT JOIN users u ON u.id = ch.user_id
+            WHERE ch.card_id = ?
+            ORDER BY ch.epoch ASC
+        """, (card_id,)).fetchall()

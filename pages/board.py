@@ -138,7 +138,9 @@ def render_columns(refresh_board, client_ids, assignee_filter=None):
                     target_column = e.target._props.get("data-column")
                     card_id = getattr(e.item, "card_id", None)
                     if card_id is not None and target_column:
-                        db.move_card(card_id, target_column, e.new_index)
+                        current_user = auth.current_user()
+                        uid = current_user["user_id"] if current_user else None
+                        db.move_card(card_id, target_column, e.new_index, user_id=uid)
                     refresh()
                 return on_end
 
@@ -415,7 +417,8 @@ def open_card_dialog(card_id, refresh_board, client_ids):
                                 db.update_card(card["id"], **updates)
                                 ui.notify("Card updated")
                             else:
-                                kwargs = {"column_name": "Backlog", "client_id": client_select.value}
+                                kwargs = {"column_name": "Backlog", "client_id": client_select.value,
+                                          "user_id": current_user["user_id"] if current_user else None}
                                 if card_type in ("Story", "Bug"):
                                     kwargs["description"] = field_refs.get("description").value if "description" in field_refs else None
                                     kwargs["assignee"] = field_refs.get("assignee").value if "assignee" in field_refs else None
@@ -430,153 +433,195 @@ def open_card_dialog(card_id, refresh_board, client_ids):
 
                         ui.button("Save", on_click=save).props("color=primary")
 
-            # ── RIGHT PANEL — comments (edit mode only) ─────────────────────
+            # ── RIGHT PANEL — comments + history (edit mode only) ────────────
             if is_edit:
                 with ui.column().classes("flex-grow p-5 gap-0").style(
                     "max-height: 82vh; min-width: 0;"
                 ):
-                    ui.label("Comments").classes("text-lg font-bold mb-3")
-
-                    # Feed area (scrollable)
-                    with ui.scroll_area().classes("flex-grow w-full").style(
-                        "height: calc(82vh - 260px); min-height: 200px;"
-                    ):
-                        feed_inner = ui.column().classes("w-full gap-0")
-
-                    # reply_to state: {"id": int, "author": str} or None
+                    panel_state = {"active": "comments"}
                     reply_state = {"parent_id": None, "parent_author": None}
-                    reply_label_ref = {}
 
-                    def render_feed():
-                        feed_inner.clear()
-                        with feed_inner:
-                            comments = db.get_comments(card["id"])
-                            # Build index for threading
-                            by_id = {c["id"]: c for c in comments}
-                            top_level = [c for c in comments if c["parent_id"] is None]
-                            replies = {}
-                            for c in comments:
-                                if c["parent_id"]:
-                                    replies.setdefault(c["parent_id"], []).append(c)
-
-                            if not comments:
-                                ui.label("No comments yet. Be the first!").classes("text-sm mt-4 text-center w-full").style("color:#8b949e")
-
-                            def render_comment(c, indent=0):
-                                margin = f"margin-left: {indent * 24}px;"
-                                author_color = c["author_color"] or "#9e9e9e"
-                                with ui.column().classes("w-full gap-1").style(margin + "margin-bottom:10px;"):
-                                    with ui.row().classes("items-center gap-2 w-full"):
-                                        # Avatar dot
-                                        if c["author_avatar"] and os.path.exists(c["author_avatar"]):
-                                            rel = c["author_avatar"].replace(db.UPLOAD_DIR, "").lstrip("/\\")
-                                            ui.image(f"/uploads/{rel}").style(
-                                                "width:24px; height:24px; border-radius:50%; "
-                                                "object-fit:cover; flex-shrink:0;"
-                                            )
-                                        else:
-                                            ui.element("div").style(
-                                                f"width:24px; height:24px; border-radius:50%; "
-                                                f"background-color:{author_color}; flex-shrink:0; "
-                                                "display:flex; align-items:center; "
-                                                "justify-content:center; color:white; "
-                                                "font-size:11px; font-weight:bold;"
-                                            ).text = (c["author_name"] or "?")[0].upper()
-
-                                        ui.label(c["author_name"] or "Unknown").classes("font-semibold text-sm")
-                                        ts = c["created_at"][:16].replace("T", " ")
-                                        ui.label(ts).classes("text-xs").style("color:color:#8b949e")
-
-                                        # Delete (own comment or admin)
-                                        if (current_user and (
-                                            current_user["user_id"] == c["author_user_id"]
-                                            or current_user.get("is_admin")
-                                        )):
-                                            def make_delete(cid=c["id"]):
-                                                def do_del():
-                                                    db.delete_comment(
-                                                        cid,
-                                                        current_user["user_id"],
-                                                        current_user.get("is_admin", False)
-                                                    )
-                                                    render_feed()
-                                                return do_del
-                                            ui.button(icon="delete", on_click=make_delete()).props(
-                                                "flat round dense size=xs color=grey"
-                                            )
-
-                                    # Content rendered as HTML
-                                    ui.html(c["content"]).classes(
-                                        "text-sm ml-8 leading-relaxed"
-                                    ).style(
-                                        "background:#21262d; border-radius:6px; "
-                                        "padding:8px 10px; margin-top:2px; color:#e6edf3;"
-                                    )
-
-                                    # Reply link
-                                    def make_reply(cid=c["id"], cname=c["author_name"]):
-                                        def do_reply():
-                                            reply_state["parent_id"] = cid
-                                            reply_state["parent_author"] = cname
-                                            if "label" in reply_label_ref:
-                                                reply_label_ref["label"].set_text(
-                                                    f"↩ Replying to {cname}"
-                                                )
-                                                reply_label_ref["cancel"].set_visibility(True)
-                                        return do_reply
-
-                                    ui.link("Reply", "#").classes("text-xs ml-8").style("color:#58a6ff").on("click", make_reply())
-
-                                    # Render nested replies
-                                    for r in replies.get(c["id"], []):
-                                        render_comment(r, indent=indent + 1)
-
-                            for c in top_level:
-                                render_comment(c)
-
-                    render_feed()
-
-                    # ── Composer ──────────────────────────────────────────
-                    with ui.column().classes("w-full gap-1 mt-2").style(
-                        "border-top: 1px solid #30363d; padding-top: 10px;"
+                    # Tab header
+                    with ui.row().classes("items-center gap-0").style(
+                        "border-bottom:1px solid #30363d; margin-bottom:8px;"
                     ):
-                        # Reply-to indicator
-                        with ui.row().classes("items-center gap-2"):
-                            reply_indicator = ui.label("").classes("text-xs italic").style("color:color:#58a6ff")
-                            reply_label_ref["label"] = reply_indicator
-
-                            def cancel_reply():
-                                reply_state["parent_id"] = None
-                                reply_state["parent_author"] = None
-                                reply_indicator.set_text("")
-                                reply_label_ref["cancel"].set_visibility(False)
-
-                            cancel_btn = ui.button(
-                                icon="close", on_click=cancel_reply
-                            ).props("flat round dense size=xs").set_visibility(False)
-                            reply_label_ref["cancel"] = cancel_btn
-
-                        comment_editor = ui.editor(placeholder="Write a comment…").classes("w-full")
-                        comment_editor.style("max-height: 120px; overflow-y: auto;")
-
-                        def post_comment():
-                            content = comment_editor.value.strip()
-                            if not content or content in ("<p></p>", "<p><br></p>"):
-                                ui.notify("Comment cannot be empty", color="warning")
-                                return
-                            db.add_comment(
-                                card["id"],
-                                current_user["user_id"],
-                                content,
-                                parent_id=reply_state["parent_id"]
+                        def tab_style(name):
+                            active = panel_state["active"] == name
+                            return (
+                                "padding:6px 18px;font-size:.85rem;font-weight:600;cursor:pointer;"
+                                "border-bottom:2px solid " + ("#2563eb" if active else "transparent") + ";"
+                                "color:" + ("#e2e8f0" if active else "#64748b") + ";"
                             )
-                            comment_editor.set_value("")
-                            cancel_reply()
+                        comments_tab_el = ui.label("Comments").style(tab_style("comments"))
+                        history_tab_el  = ui.label("History").style(tab_style("history"))
+
+                    @ui.refreshable
+                    def right_panel():
+                        if panel_state["active"] == "history":
+                            events_list = db.get_card_history(card["id"])
+                            with ui.scroll_area().classes("w-full").style(
+                                "height:calc(82vh - 130px);min-height:180px;"
+                            ):
+                                with ui.column().classes("w-full").style("gap:0;padding:4px 2px;"):
+                                    if not events_list:
+                                        ui.label("No history yet.").style(
+                                            "color:#8b949e;font-size:.85rem;"
+                                            "margin-top:16px;text-align:center;width:100%;"
+                                        )
+                                    else:
+                                        for i, ev in enumerate(events_list):
+                                            is_last    = (i == len(events_list) - 1)
+                                            user_name  = ev["user_name"] or ev["username"] or "System"
+                                            user_color = ev["user_color"] or "#64748b"
+                                            epoch      = ev["epoch"]
+                                            from_col   = ev["from_column"]
+                                            to_col     = ev["to_column"]
+
+                                            with ui.row().classes("w-full gap-3 items-start").style("padding:6px 2px;"):
+                                                with ui.column().classes("items-center").style("width:18px;flex-shrink:0;gap:0;"):
+                                                    ui.element("div").style(
+                                                        f"width:10px;height:10px;border-radius:50%;"
+                                                        f"background:{user_color};margin-top:5px;"
+                                                        f"border:2px solid #0d1117;flex-shrink:0;"
+                                                    )
+                                                    if not is_last:
+                                                        ui.element("div").style(
+                                                            "width:2px;height:34px;background:#30363d;"
+                                                            "margin:3px auto 0;flex-shrink:0;"
+                                                        )
+                                                with ui.column().classes("flex-grow").style("gap:2px;"):
+                                                    if from_col is None:
+                                                        action = (
+                                                            f'<span style="color:#e2e8f0;font-weight:600">{user_name}</span>'
+                                                            f'<span style="color:#94a3b8"> created this card in </span>'
+                                                            f'<span style="color:#60a5fa;font-weight:600">{to_col}</span>'
+                                                        )
+                                                    else:
+                                                        action = (
+                                                            f'<span style="color:#e2e8f0;font-weight:600">{user_name}</span>'
+                                                            f'<span style="color:#94a3b8"> moved </span>'
+                                                            f'<span style="color:#94a3b8">{from_col}</span>'
+                                                            f'<span style="color:#475569"> → </span>'
+                                                            f'<span style="color:#60a5fa;font-weight:600">{to_col}</span>'
+                                                        )
+                                                    ui.html(action).style("font-size:.85rem;line-height:1.5;")
+                                                    # Timestamp: store epoch in data attr, convert via page-level JS
+                                                    ui.html(
+                                                        f'<span class="epoch-ts" data-epoch="{epoch}" '
+                                                        f'style="font-size:.72rem;color:#64748b;">…</span>'
+                                                    )
+                                        # Convert all epoch spans to local time
+                                        ui.run_javascript(
+                                            "document.querySelectorAll('.epoch-ts').forEach("
+                                            "el => el.textContent = new Date(parseInt(el.dataset.epoch)*1000).toLocaleString()"
+                                            ");"
+                                        )
+                        else:
+                            with ui.scroll_area().classes("w-full").style(
+                                "height:calc(82vh - 260px);min-height:180px;"
+                            ):
+                                feed_inner = ui.column().classes("w-full").style("gap:0;")
+
+                            def render_feed():
+                                feed_inner.clear()
+                                with feed_inner:
+                                    comments  = db.get_comments(card["id"])
+                                    top_level = [c for c in comments if c["parent_id"] is None]
+                                    replies   = {}
+                                    for c in comments:
+                                        if c["parent_id"]:
+                                            replies.setdefault(c["parent_id"], []).append(c)
+                                    if not comments:
+                                        ui.label("No comments yet. Be the first!").style(
+                                            "color:#8b949e;font-size:.85rem;margin-top:16px;"
+                                            "text-align:center;width:100%;"
+                                        )
+
+                                    def render_comment(c, indent=0):
+                                        author_color = c["author_color"] or "#9e9e9e"
+                                        with ui.column().classes("w-full gap-1").style(
+                                            f"margin-left:{indent*22}px;margin-bottom:10px;"
+                                        ):
+                                            with ui.row().classes("items-center gap-2 w-full"):
+                                                if c["author_avatar"] and os.path.exists(c["author_avatar"]):
+                                                    rel = c["author_avatar"].replace(db.UPLOAD_DIR, "").lstrip("/\\")
+                                                    ui.image(f"/uploads/{rel}").style(
+                                                        "width:24px;height:24px;border-radius:50%;"
+                                                        "object-fit:cover;flex-shrink:0;"
+                                                    )
+                                                else:
+                                                    ui.element("div").style(
+                                                        f"width:24px;height:24px;border-radius:50%;"
+                                                        f"background:{author_color};flex-shrink:0;"
+                                                        "display:flex;align-items:center;justify-content:center;"
+                                                        "color:white;font-size:11px;font-weight:bold;"
+                                                    ).text = (c["author_name"] or "?")[0].upper()
+                                                ui.label(c["author_name"] or "Unknown").classes("font-semibold text-sm")
+                                                ui.label(c["created_at"][:16].replace("T", " ")).classes("text-xs").style("color:#8b949e")
+                                                if current_user and (
+                                                    current_user["user_id"] == c["author_user_id"]
+                                                    or current_user.get("is_admin")
+                                                ):
+                                                    def make_delete(cid=c["id"]):
+                                                        def do_del():
+                                                            db.delete_comment(cid, current_user["user_id"], current_user.get("is_admin", False))
+                                                            render_feed()
+                                                        return do_del
+                                                    ui.button(icon="delete", on_click=make_delete()).props("flat round dense size=xs color=grey")
+                                            ui.html(c["content"]).classes("text-sm ml-8 leading-relaxed").style(
+                                                "background:#21262d;border-radius:6px;"
+                                                "padding:8px 10px;margin-top:2px;color:#e6edf3;"
+                                            )
+                                            def make_reply(cid=c["id"], cname=c["author_name"]):
+                                                def do_reply():
+                                                    reply_state["parent_id"]     = cid
+                                                    reply_state["parent_author"] = cname
+                                                    reply_indicator.set_text(f"↩ Replying to {cname}")
+                                                    cancel_btn.set_visibility(True)
+                                                return do_reply
+                                            ui.link("Reply", "#").classes("text-xs ml-8").style("color:#58a6ff;").on("click", make_reply())
+                                            for r in replies.get(c["id"], []):
+                                                render_comment(r, indent=indent + 1)
+                                    for c in top_level:
+                                        render_comment(c)
+
                             render_feed()
 
-                        ui.button("Post Comment", icon="send", on_click=post_comment).props(
-                            "color=primary dense"
-                        ).classes("self-end")
+                            with ui.column().classes("w-full gap-1 mt-2").style(
+                                "border-top:1px solid #30363d;padding-top:10px;flex-shrink:0;"
+                            ):
+                                with ui.row().classes("items-center gap-2"):
+                                    reply_indicator = ui.label("").classes("text-xs italic").style("color:#58a6ff;")
+                                    def cancel_reply():
+                                        reply_state["parent_id"]     = None
+                                        reply_state["parent_author"] = None
+                                        reply_indicator.set_text("")
+                                        cancel_btn.set_visibility(False)
+                                    cancel_btn = ui.button(icon="close", on_click=cancel_reply).props("flat round dense size=xs")
+                                    cancel_btn.set_visibility(False)
+                                comment_editor = ui.editor(placeholder="Write a comment…").classes("w-full")
+                                comment_editor.style("max-height:120px;overflow-y:auto;")
+                                def post_comment():
+                                    content_val = comment_editor.value.strip()
+                                    if not content_val or content_val in ("<p></p>", "<p><br></p>"):
+                                        ui.notify("Comment cannot be empty", color="warning")
+                                        return
+                                    db.add_comment(card["id"], current_user["user_id"], content_val, parent_id=reply_state["parent_id"])
+                                    comment_editor.set_value("")
+                                    cancel_reply()
+                                    render_feed()
+                                ui.button("Post Comment", icon="send", on_click=post_comment).props("color=primary dense").classes("self-end")
+
+                    right_panel()
+
+                    def switch_tab(name):
+                        panel_state["active"] = name
+                        comments_tab_el.style(tab_style("comments"))
+                        history_tab_el.style(tab_style("history"))
+                        right_panel.refresh()
+
+                    comments_tab_el.on("click", lambda: switch_tab("comments"))
+                    history_tab_el.on("click",  lambda: switch_tab("history"))
 
     dialog.open()
 
