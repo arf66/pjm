@@ -1,0 +1,2 @@
+nicegui>=3.13.0
+fastapi>=0.137.1
