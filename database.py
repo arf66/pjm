@@ -115,6 +115,8 @@ def init_db():
                 to_column TEXT NOT NULL,
                 user_id INTEGER,
                 epoch INTEGER NOT NULL,
+                event_type TEXT NOT NULL DEFAULT 'column',
+                extra TEXT,
                 FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE,
                 FOREIGN KEY (user_id) REFERENCES users(id)
             )
@@ -141,6 +143,13 @@ def init_db():
         # Migration: add card_number column to cards if missing
         if "card_number" not in existing_columns:
             c.execute("ALTER TABLE cards ADD COLUMN card_number TEXT")
+
+        # Migration: add event_type and extra columns to card_history if missing
+        existing_history_columns = [row["name"] for row in c.execute("PRAGMA table_info(card_history)").fetchall()]
+        if "event_type" not in existing_history_columns:
+            c.execute("ALTER TABLE card_history ADD COLUMN event_type TEXT NOT NULL DEFAULT 'column'")
+        if "extra" not in existing_history_columns:
+            c.execute("ALTER TABLE card_history ADD COLUMN extra TEXT")
 
         # Migration: add avatar_path and color columns to users if missing
         existing_user_columns = [row["name"] for row in c.execute("PRAGMA table_info(users)").fetchall()]
@@ -427,8 +436,8 @@ def create_card(card_type, title, description=None, assignee=None, expected_deli
         new_id = cur.lastrowid
         # Record creation event: from_column=None means "created here"
         conn.execute(
-            "INSERT INTO card_history (card_id, from_column, to_column, user_id, epoch) VALUES (?,?,?,?,?)",
-            (new_id, None, column_name, user_id, epoch)
+            "INSERT INTO card_history (card_id, from_column, to_column, user_id, epoch, event_type) VALUES (?,?,?,?,?,?)",
+            (new_id, None, column_name, user_id, epoch, "column")
         )
         return new_id
 
@@ -485,8 +494,8 @@ def move_card(card_id, new_column, new_position, user_id=None):
                 (new_column, new_position)
             )
             conn.execute(
-                "INSERT INTO card_history (card_id, from_column, to_column, user_id, epoch) VALUES (?,?,?,?,?)",
-                (card_id, old_column, new_column, user_id, int(_t.time()))
+                "INSERT INTO card_history (card_id, from_column, to_column, user_id, epoch, event_type) VALUES (?,?,?,?,?,?)",
+                (card_id, old_column, new_column, user_id, int(_t.time()), "column")
             )
 
         conn.execute(
@@ -614,8 +623,20 @@ def add_history_event(card_id: int, to_column: str, user_id: int = None, from_co
     epoch = int(_time.time())
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO card_history (card_id, from_column, to_column, user_id, epoch) VALUES (?,?,?,?,?)",
-            (card_id, from_column, to_column, user_id, epoch)
+            "INSERT INTO card_history (card_id, from_column, to_column, user_id, epoch, event_type) VALUES (?,?,?,?,?,?)",
+            (card_id, from_column, to_column, user_id, epoch, "column")
+        )
+
+
+def add_assignment_history_event(card_id: int, from_assignee: str, to_assignee: str, user_id: int = None, current_column: str = "Backlog"):
+    """Record an assignee change for a card."""
+    epoch = int(_time.time())
+    # extra stores JSON-like: 'from_assignee→to_assignee'
+    extra = f"{from_assignee or ''}→{to_assignee or ''}"
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO card_history (card_id, from_column, to_column, user_id, epoch, event_type, extra) VALUES (?,?,?,?,?,?,?)",
+            (card_id, current_column, current_column, user_id, epoch, "assignment", extra)
         )
 
 
@@ -624,6 +645,7 @@ def get_card_history(card_id: int):
     with get_conn() as conn:
         return conn.execute("""
             SELECT ch.id, ch.card_id, ch.from_column, ch.to_column, ch.epoch,
+                   ch.event_type, ch.extra,
                    u.full_name  AS user_name,
                    u.color      AS user_color,
                    u.avatar_path AS user_avatar,

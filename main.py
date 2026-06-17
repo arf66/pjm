@@ -42,7 +42,8 @@ def profile():
 
 ui.run(
     title="PM Tracker",
+    favicon="/static/favicon.png",
     storage_secret="pm-tracker-secret-key-change-in-production",
-    port=3120,
+    port=3320,
     reload=False,
 )

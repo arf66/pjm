@@ -410,11 +410,28 @@ def open_card_dialog(card_id, refresh_board, client_ids):
                                 updates = {"title": title, "client_id": client_select.value}
                                 if card_type in ("Story", "Bug"):
                                     updates["description"] = field_refs.get("description").value if "description" in field_refs else None
-                                    updates["assignee"] = field_refs.get("assignee").value if "assignee" in field_refs else None
+                                    new_assignee = field_refs.get("assignee").value if "assignee" in field_refs else None
+                                    old_assignee = card["assignee"]
+                                    updates["assignee"] = new_assignee
                                     updates["expected_delivery"] = field_refs.get("expected_delivery").value if "expected_delivery" in field_refs else None
                                 elif card_type == "Epic":
                                     updates["description"] = field_refs.get("description").value if "description" in field_refs else None
+                                    new_assignee = None
+                                    old_assignee = None
+                                else:
+                                    new_assignee = None
+                                    old_assignee = None
                                 db.update_card(card["id"], **updates)
+                                # Record assignee change in history
+                                if card_type in ("Story", "Bug") and new_assignee != old_assignee:
+                                    uid = current_user["user_id"] if current_user else None
+                                    db.add_assignment_history_event(
+                                        card["id"],
+                                        from_assignee=old_assignee,
+                                        to_assignee=new_assignee,
+                                        user_id=uid,
+                                        current_column=card["column_name"],
+                                    )
                                 ui.notify("Card updated")
                             else:
                                 kwargs = {"column_name": "Backlog", "client_id": client_select.value,
@@ -476,6 +493,8 @@ def open_card_dialog(card_id, refresh_board, client_ids):
                                             epoch      = ev["epoch"]
                                             from_col   = ev["from_column"]
                                             to_col     = ev["to_column"]
+                                            event_type = ev["event_type"] if "event_type" in ev.keys() else "column"
+                                            extra      = ev["extra"] if "extra" in ev.keys() else None
 
                                             with ui.row().classes("w-full gap-3 items-start").style("padding:6px 2px;"):
                                                 with ui.column().classes("items-center").style("width:18px;flex-shrink:0;gap:0;"):
@@ -490,7 +509,20 @@ def open_card_dialog(card_id, refresh_board, client_ids):
                                                             "margin:3px auto 0;flex-shrink:0;"
                                                         )
                                                 with ui.column().classes("flex-grow").style("gap:2px;"):
-                                                    if from_col is None:
+                                                    if event_type == "assignment":
+                                                        parts = extra.split("→", 1) if extra else ["", ""]
+                                                        from_a = parts[0].strip() or "Unassigned"
+                                                        to_a   = parts[1].strip() if len(parts) > 1 else "Unassigned"
+                                                        if not parts[1].strip():
+                                                            to_a = "Unassigned"
+                                                        action = (
+                                                            f'<span style="color:#e2e8f0;font-weight:600">{user_name}</span>'
+                                                            f'<span style="color:#94a3b8"> changed assignee: </span>'
+                                                            f'<span style="color:#94a3b8">{from_a}</span>'
+                                                            f'<span style="color:#475569"> → </span>'
+                                                            f'<span style="color:#34d399;font-weight:600">{to_a}</span>'
+                                                        )
+                                                    elif from_col is None:
                                                         action = (
                                                             f'<span style="color:#e2e8f0;font-weight:600">{user_name}</span>'
                                                             f'<span style="color:#94a3b8"> created this card in </span>'
@@ -629,13 +661,40 @@ def open_card_dialog(card_id, refresh_board, client_ids):
 def render_attachments(container, card_id):
     container.clear()
     attachments = db.get_attachments(card_id)
+    IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}
     with container:
         if not attachments:
-            ui.label("No attachments yet").classes("text-xs").style("color:color:#8b949e")
+            ui.label("No attachments yet").classes("text-xs").style("color:#8b949e")
         for att in attachments:
-            with ui.row().classes("items-center gap-2"):
-                ui.icon("description", size="16px")
-                ui.label(att["filename"]).classes("text-sm")
+            rel = att["stored_path"].replace(db.UPLOAD_DIR, "").lstrip("/\\")
+            url = f"/uploads/{rel}"
+            ext = os.path.splitext(att["filename"])[1].lower()
+            is_image = ext in IMAGE_EXTS
+
+            with ui.row().classes("items-center gap-1 w-full"):
+                ui.icon("description" if not is_image else "image", size="16px").style("flex-shrink:0;")
+                ui.label(att["filename"]).classes("text-sm flex-grow truncate")
+
+                # Preview / open button
+                if is_image:
+                    def make_preview(img_url=url, fname=att["filename"]):
+                        def preview():
+                            with ui.dialog() as preview_dlg, ui.card().classes("p-3 gap-2 items-center").style("max-width:90vw;max-height:90vh;"):
+                                ui.label(fname).classes("text-sm font-semibold")
+                                ui.image(img_url).style(
+                                    "max-width:80vw;max-height:75vh;object-fit:contain;"
+                                )
+                                ui.button("Close", on_click=preview_dlg.close).props("flat dense")
+                            preview_dlg.open()
+                        return preview
+                    ui.button(icon="visibility", on_click=make_preview()).props(
+                        "flat round dense size=sm"
+                    ).tooltip("Preview")
+                else:
+                    # Non-image: open in new tab
+                    ui.button(icon="open_in_new", on_click=lambda u=url: ui.navigate.to(u, new_tab=True)).props(
+                        "flat round dense size=sm"
+                    ).tooltip("Open")
 
                 def make_delete(att_id=att["id"]):
                     def delete():
@@ -643,7 +702,7 @@ def render_attachments(container, card_id):
                         render_attachments(container, card_id)
                     return delete
 
-                ui.button(icon="close", on_click=make_delete()).props("flat round dense size=sm")
+                ui.button(icon="close", on_click=make_delete()).props("flat round dense size=sm").tooltip("Delete")
 
 
 def render_linked_stories(container, epic_id, refresh_board, dialog, client_ids):
